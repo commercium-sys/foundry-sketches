@@ -6,17 +6,20 @@ import {Script, console} from "forge-std/Script.sol";
 import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 
-import { UserOperation, UserOperationLib } from "../src/libs/UserOperation.sol";
-import { DepositPaymaster } from "../src/DepositPaymaster.sol";
-import { VerifyingPaymaster } from "../src/VerifyingPaymaster.sol";
-import { BaseAccount } from "../src/core/BaseAccount.sol";
-import { Account } from "../src/Account.sol";
-import { AccountFactory } from "../src/AccountFactory.sol";
-import { IEntryPoint } from "../src/interfaces/IEntrypoint.sol";
-import { IStakeManager } from "../src/interfaces/IStakeManager.sol";
+import { UserOperation, UserOperationLib } from "../src/eip4337Script/libs/UserOperation.sol";
+import { DepositPaymaster } from "../src/eip4337Script/DepositPaymaster.sol";
+import { VerifyingPaymaster } from "../src/eip4337Script/VerifyingPaymaster.sol";
+import { BaseAccount } from "../src/eip4337Script/core/BaseAccount.sol";
+import { Account } from "../src/eip4337Script/Account.sol";
+import { AccountFactory } from "../src/eip4337Script/AccountFactory.sol";
+import { IEntryPoint } from "../src/eip4337Script/interfaces/IEntrypoint.sol";
+import { IStakeManager } from "../src/eip4337Script/interfaces/IStakeManager.sol";
 
-import { EntryPoint } from "../src/core/EntryPoint.sol";
-import { SenderCreator } from "../src/core/SenderCreator.sol";
+import { EntryPoint } from "../src/eip4337Script/core/EntryPoint.sol";
+import { SenderCreator } from "../src/eip4337Script/core/SenderCreator.sol";
+
+import { VmSafe } from "forge-std/Vm.sol";
+
 
 contract AAScript is Script {
 
@@ -24,21 +27,17 @@ contract AAScript is Script {
 
     function run() public {
 
-        uint privk = vm.envUint("DEPLOYER_PRIVATE_KEY");
-        address payable pubk = payable(vm.rememberKey(privk));
+        VmSafe.Wallet memory wallet = vm.createWallet("wallet");
 
-        vm.startBroadcast(pubk);
+        vm.deal(wallet.addr, 100 ether);
 
-        IEntryPoint entrypoint = IEntryPoint(vm.envAddress("EIP_4337_ENTRYPOINT"));
+        vm.startBroadcast(wallet.addr);
 
-        AccountFactory accountFactory = 
-            AccountFactory(vm.envAddress("EIP_4337_ACCOUNT_FACTORY"));
-            // new AccountFactory(address(entrypoint));
+        IEntryPoint entrypoint = IEntryPoint(0x5FF137D4b0FDCD49DcA30c7CF57E578a026d2789);
 
-        address eip4337WalletAddr = accountFactory.getAddress(pubk, 1);
+        AccountFactory accountFactory = AccountFactory(0xb1d4bDDc41d51057587bdF373ebcaf61c76f31c8);
 
-        // if (entrypoint.balanceOf(eip4337WalletAddr) == 0)
-        //     entrypoint.depositTo{value: .05 ether}(eip4337WalletAddr);
+        address eip4337WalletAddr = accountFactory.getAddress(wallet.addr, 1);
 
         UserOperation memory userOp = UserOperation({
             sender: eip4337WalletAddr,
@@ -47,7 +46,7 @@ contract AAScript is Script {
                 address(accountFactory),
                 abi.encodeWithSelector(
                     AccountFactory.createAccount.selector,
-                    pubk,
+                    wallet.addr,
                     1
                 )
             ),
@@ -62,118 +61,44 @@ contract AAScript is Script {
         });
 
         VerifyingPaymaster verifyingPaymaster = 
-            VerifyingPaymaster(payable(vm.envAddress("EIP_4337_VERIFYING_PAYMASTER")));
+            VerifyingPaymaster(payable(0x40CD4FFC9D4BfC82fdf5FB922d07bE8d0032299d));
 
-        // VerifyingPaymaster verifyingPaymaster = new VerifyingPaymaster(
-        //     address(entrypoint),
-        //     pubk
-        // );
+        IEntryPoint.DepositInfo memory info = entrypoint.getDepositInfo(address(verifyingPaymaster));
 
-        bytes32 digest = MessageHashUtils.toEthSignedMessageHash(
-            verifyingPaymaster.getHash(
-                userOp,
-                uint48(block.timestamp + 200000),
-                uint48(block.timestamp)
-            )
-        );
+        if (info.deposit == 0)
+            verifyingPaymaster.deposit{value: .05 ether}();
 
-        ( uint8 v, bytes32 r, bytes32 s ) = vm.sign(privk, digest);
+        if (info.stake == 0)
+            verifyingPaymaster.addStake{value: .05 ether}(84600);
 
-        userOp.paymasterAndData = abi.encodePacked(
-            address(verifyingPaymaster),
-            abi.encode(
-                uint48(block.timestamp + 200000),
-                uint48(block.timestamp)
-            ),
-            bytes.concat(r,s,bytes1(v))
-        );
+        {
+            bytes32 paymasterDigest = 
+                MessageHashUtils.toEthSignedMessageHash(
+                    verifyingPaymaster.getHash
+                        (userOp, uint48(block.timestamp + 200000), uint48(block.timestamp)));
 
-        digest = MessageHashUtils.toEthSignedMessageHash(entrypoint.getUserOpHash(userOp));
+            ( uint8 v, bytes32 r, bytes32 s ) = vm.sign(wallet.privateKey, paymasterDigest);
 
-        (v, r, s) = vm.sign(privk, digest);
-        userOp.signature = bytes.concat(r, s, bytes1(v));
+            userOp.paymasterAndData = abi.encodePacked(
+                address(verifyingPaymaster),
+                abi.encode(uint48(block.timestamp + 200000), uint48(block.timestamp)),
+                bytes.concat(r,s,bytes1(v))
+            );
+        }
+
+        {
+            bytes32 userOpDigest = 
+                MessageHashUtils.toEthSignedMessageHash(entrypoint.getUserOpHash(userOp));
+
+            ( uint8 v, bytes32 r, bytes32 s ) = vm.sign(wallet.privateKey, userOpDigest);
+
+            userOp.signature = bytes.concat(r, s, bytes1(v));
+        }
 
         UserOperation[] memory ops = new UserOperation[](1);
         ops[0] = userOp;
 
-        verifyingPaymaster.addStake{value: .05 ether}(84600);
-
-        verifyingPaymaster.deposit{value: .05 ether}();
-
-        entrypoint.handleOps(ops, pubk);
-
-    }
-}
-
-contract Sim is Script {
-    function run () public {
-
-        EntryPoint replacement = new EntryPoint();
-
-        address eip4337Entry = vm.envAddress("EIP_4337_ENTRYPOINT");
-
-        vm.etch(eip4337Entry, address(replacement).code);
-
-        eip4337Entry.call(vm.envBytes("PAYLOAD"));
-
-    }
-}
-
-contract Withdraw is Script {
-    function run () public {
-
-        VerifyingPaymaster vp = VerifyingPaymaster(payable(vm.envAddress("EIP_4337_VERIFYING_PAYMASTER")));
-        EntryPoint ep = EntryPoint(payable(vm.envAddress("EIP_4337_ENTRYPOINT")));
-
-        uint privk = vm.envUint("DEPLOYER_PRIVATE_KEY");
-
-        address payable pubk = payable(vm.rememberKey(privk));
-
-        EntryPoint.DepositInfo memory info = ep.getDepositInfo(address(vp));
-
-        vm.broadcast(pubk);
-
-        vp.withdrawTo(pubk, info.deposit);
-
-    }
-}
-
-contract DepositIntoEntrypointForPaymaster is Script {
-
-    function run () public {
-
-        uint privk = vm.envUint("DEPLOYER_PRIVATE_KEY");
-        address payable pubk  = payable(vm.rememberKey(privk));
-
-        IEntryPoint entrypoint = IEntryPoint(vm.envAddress("AA_ENTRYPOINT"));
-
-        address verifyingPaymaster = vm.envAddress("AA_VERIFYING_PAYMASTER");
-
-        vm.startBroadcast(pubk);
-
-        entrypoint.depositTo{value: .5 ether}(address(verifyingPaymaster));
-
-    }
-
-}
-
-contract DeployVerifyingPaymaster is Script {
-
-    function run () public {
-
-        uint privk = vm.envUint("DEPLOYER_PRIVATE_KEY");
-        address payable pubk  = payable(vm.rememberKey(privk));
-
-        IEntryPoint entrypoint = IEntryPoint(vm.envAddress("AA_ENTRYPOINT"));
-
-        vm.startBroadcast(pubk);
-
-        VerifyingPaymaster verifyingPaymaster = new VerifyingPaymaster(
-            address(entrypoint),
-            pubk
-        );
-
-        vm.stopBroadcast();
+        entrypoint.handleOps{gas: 200000}(ops, payable(wallet.addr));
 
     }
 }
